@@ -1479,7 +1479,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
 {
     gboolean event_in_close_button = FALSE;
     if (!popup_menu && tk->tb->_show_close_buttons && tk->button_close && gtk_widget_get_visible(GTK_WIDGET(tk->button_close))) {
-        // FIXME: какой нормальный способ узнать, находится ли мышь в пределах виджета?
+        // FIXME: what is the better way to find out if the mouse pointer is inside the widget?
         gint dest_x, dest_y;
         gtk_widget_translate_coordinates(widget, tk->button_close, event->x, event->y, &dest_x, &dest_y);
         if (dest_x >= 0 && dest_y >= 0 && dest_x < GTK_WIDGET(tk->button_close)->allocation.width && dest_y <= GTK_WIDGET(tk->button_close)->allocation.height) {
