@@ -439,7 +439,8 @@ static void dclock_configure(Plugin * p, GtkWindow * parent)
         _("Tooltip only"), &dc->icon_only, CONF_TYPE_BOOL,
         _("Center text"), &dc->center_text, CONF_TYPE_BOOL,
         NULL);
-    gtk_window_present(GTK_WINDOW(dlg));
+    if (dlg)
+        gtk_window_present(GTK_WINDOW(dlg));
 }
 
 /* Callback when the configuration is to be saved. */
