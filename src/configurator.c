@@ -1239,6 +1239,16 @@ static void on_toggle_changed( GtkToggleButton* btn, gpointer user_data )
     notify_apply_config( GTK_WIDGET(btn) );
 }
 
+static void on_enum_changed( GtkComboBox *widget, gpointer user_data )
+{
+    int* val = (gboolean*)user_data;
+    int v = gtk_combo_box_get_active( widget );
+    if (*val != v) {
+        *val = gtk_combo_box_get_active( widget );
+        notify_apply_config( GTK_WIDGET(widget) );
+    }
+}
+
 static void on_file_chooser_btn_file_set(GtkFileChooser* btn, char** val)
 {
     g_free( *val );
@@ -1307,13 +1317,23 @@ GtkWidget* create_generic_config_dlg( const char* title, GtkWidget* parent,
 
     gtk_box_set_spacing( GTK_BOX(GTK_DIALOG(dlg)->vbox), 4 );
 
+    gchar** params = NULL;
+
     va_start( args, name );
     while( name )
     {
-        GtkWidget* label = gtk_label_new( name );
-        GtkWidget* entry = NULL;
         gpointer val = va_arg( args, gpointer );
         GType type = va_arg( args, GType );
+
+        if (type == CONF_TYPE_ENUM) {
+            char d[2] = {name[0], 0};
+            params = g_strsplit(name, d, 9999);
+            name = params[1];
+        }
+
+        GtkWidget* label = gtk_label_new( name );
+        GtkWidget* entry = NULL;
+
         switch( type )
         {
             case CONF_TYPE_STR:
@@ -1357,6 +1377,17 @@ GtkWidget* create_generic_config_dlg( const char* title, GtkWidget* parent,
                 g_free (markup);
                 }
                 break;
+            case CONF_TYPE_ENUM:
+                entry = gtk_combo_box_new_text();
+                int i;
+                for (i = 2; params[i]; i++) {
+                    gtk_combo_box_append_text(GTK_COMBO_BOX(entry), params[i]);
+                }
+                gtk_combo_box_set_active(GTK_COMBO_BOX(entry), *(int*)val);
+                //gtk_toggle_button_set_active( GTK_TOGGLE_BUTTON(entry), *(gboolean*)val );
+                g_signal_connect( entry, "changed",
+                  G_CALLBACK(on_enum_changed), val );
+                break;
         }
         if( entry )
         {
@@ -1380,6 +1411,11 @@ GtkWidget* create_generic_config_dlg( const char* title, GtkWidget* parent,
                 }
             }
         }
+        if (params != NULL) {
+            g_strfreev(params);
+            params = NULL;
+        }
+
         name = va_arg( args, const char* );
     }
     va_end( args );

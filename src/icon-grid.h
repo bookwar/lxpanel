@@ -71,6 +71,8 @@ extern void icon_grid_remove(IconGrid * ig, GtkWidget * child);
 						/* Remove a child from the icon grid */
 extern void icon_grid_reorder_child(IconGrid * ig, GtkWidget * child, gint position);
 						/* Reorder the position of a child in the icon grid */
+extern void icon_grid_place_child_after(IconGrid * ig, GtkWidget * child, GtkWidget * after);
+						/*  */
 extern void icon_grid_set_visible(IconGrid * ig, GtkWidget * child, gboolean visible);
 						/* Set the visibility of a child in the icon grid */
 extern void icon_grid_free(IconGrid * ig);	/* Free the icon grid */

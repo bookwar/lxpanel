@@ -50,6 +50,19 @@ struct _taskbar;
 struct _task_class;
 struct _task;
 
+enum TASKBAR_MODE {
+    MODE_CLASSIC,
+    MODE_GROUP_SIDE_BY_SIDE,
+    MODE_GROUP_INTO_BUTTON,
+    MODE_SINGLE_WINDOW
+};
+
+enum {
+    SHOW_ICONS,
+    SHOW_TITLES,
+    SHOW_BOTH
+};
+
 /* Structure representing a class.  This comes from WM_CLASS, and should identify windows that come from an application. */
 typedef struct _task_class {
     struct _task_class * res_class_flink;	/* Forward link */
@@ -71,9 +84,11 @@ typedef struct _task {
     TaskClass * res_class;			/* Class, from WM_CLASS */
     struct _task * res_class_flink;		/* Forward link to task in same class */
     GtkWidget * button;				/* Button representing task in taskbar */
+    GtkWidget * container;			/* Container for image, label and close button. */
     GtkWidget * image;				/* Icon for task, child of button */
     Atom image_source;				/* Atom that is the source of taskbar icon */
     GtkWidget * label;				/* Label for task, child of button */
+    GtkWidget * button_close;			/* Close button */
     int desktop;				/* Desktop that contains task, needed to switch to it on Raise */
     guint flash_timeout;			/* Timer for urgency notification */
     unsigned int focused : 1;			/* True if window has focus */
@@ -82,6 +97,8 @@ typedef struct _task {
     unsigned int flash_state : 1;		/* One-bit counter to flash taskbar */
     unsigned int entered_state : 1;		/* True if cursor is inside taskbar button */
     unsigned int present_in_client_list : 1;	/* State during WM_CLIENT_LIST processing to detect deletions */
+
+    GtkWidget* click_on;
 } Task;
 
 /* Private context for taskbar plugin. */
@@ -100,17 +117,30 @@ typedef struct _taskbar {
     Task * menutask;				/* Task for which popup menu is open */
     guint dnd_delay_timer;			/* Timer for drag and drop delay */
     int icon_size;				/* Size of task icons */
+    int extra_size;
     gboolean show_all_desks;			/* User preference: show windows from all desktops */
     gboolean tooltips;				/* User preference: show tooltips */
-    gboolean icons_only;			/* User preference: show icons only, omit name */
+    int show_icons_titles;			/* User preference: show icons, titles */
+    gboolean show_close_buttons;		/* User preference: show close button */
     gboolean use_mouse_wheel;			/* User preference: scroll wheel does iconify and raise */
     gboolean use_urgency_hint;			/* User preference: windows with urgency will flash */
     gboolean flat_button;			/* User preference: taskbar buttons have visible background */
-    gboolean grouped_tasks;			/* User preference: windows from same task are grouped onto a single button */
+    int mode;                                   /* User preference: view mode */
+    gboolean selfgroup_single_window;           /* User preference: create groups for "alone" windows */
     int task_width_max;				/* Maximum width of a taskbar button in horizontal orientation */
     int spacing;				/* Spacing between taskbar buttons */
     gboolean use_net_active;			/* NET_WM_ACTIVE_WINDOW is supported by the window manager */
     gboolean net_active_checked;		/* True if use_net_active is valid */
+
+    /* Effective config values, evaluated from "User preference" variables: */
+    gboolean grouped_tasks;			/* Group task of the same class into single button. */
+    gboolean single_window;			/* Show only current window button. */
+    gboolean group_side_by_side;		/* Group task of the same class side by side. (value from last gui rebuild) */
+    gboolean rebuild_gui;			/* Force gui rebuild (when configuration changed) */
+    gboolean show_all_desks_prev_value;         /* Value of show_all_desks from last gui rebuild */
+    gboolean show_icons;			/* Show icons */
+    gboolean show_titles;			/* Show title labels */
+    gboolean _show_close_buttons;               /* Show close buttons */
 } TaskbarPlugin;
 
 static gchar *taskbar_rc = "style 'taskbar-style'\n"
@@ -129,7 +159,7 @@ static gchar *taskbar_rc = "style 'taskbar-style'\n"
 #define TASK_PADDING         4
 #define ALL_WORKSPACES       0xFFFFFFFF		/* 64-bit clean */
 #define ICON_ONLY_EXTRA      6		/* Amount needed to have button lay out symmetrically */
-#define ICON_BUTTON_TRIM 4		/* Amount needed to have button remain on panel */
+#define BUTTON_HEIGHT_EXTRA  4          /* Amount needed to have button not clip icon */
 
 static void set_timer_on_task(Task * tk);
 static gboolean task_is_visible_on_current_desktop(TaskbarPlugin * tb, Task * tk);
@@ -170,6 +200,7 @@ static gboolean taskbar_button_scroll_event(GtkWidget * widget, GdkEventScroll *
 static void taskbar_button_size_allocate(GtkWidget * btn, GtkAllocation * alloc, Task * tk);
 static void taskbar_update_style(TaskbarPlugin * tb);
 static void task_update_style(Task * tk, TaskbarPlugin * tb);
+static void task_build_gui_button_close(TaskbarPlugin * tb, Task* tk);
 static void task_build_gui(TaskbarPlugin * tb, Task * tk);
 static void taskbar_net_client_list(GtkWidget * widget, TaskbarPlugin * tb);
 static void taskbar_net_current_desktop(GtkWidget * widget, TaskbarPlugin * tb);
@@ -202,10 +233,29 @@ static void set_timer_on_task(Task * tk)
     tk->flash_timeout = g_timeout_add(interval, (GSourceFunc) flash_window_timeout, tk);
 }
 
+static int get_task_button_max_width(TaskbarPlugin * tb)
+{
+    if (tb->show_titles) {
+        return (tb->single_window) ? 9999 : tb->task_width_max;
+    } else {
+        return tb->icon_size + ICON_ONLY_EXTRA + (tb->_show_close_buttons ? tb->extra_size : 0);
+    }
+}
+
+static int task_button_is_really_flat(TaskbarPlugin * tb)
+{
+    return ( tb->single_window || tb->flat_button );
+}
+
+static int task_class_is_grouped(TaskbarPlugin * tb, TaskClass * tc)
+{
+    return (tb->grouped_tasks) && (tc != NULL) && (tc->visible_count > 1 || tb->selfgroup_single_window);
+}
+
 /* Determine if a task is visible considering only its desktop placement. */
 static gboolean task_is_visible_on_current_desktop(TaskbarPlugin * tb, Task * tk)
 {
-    return ((tk->desktop == ALL_WORKSPACES) || (tk->desktop == tb->current_desktop) || (tb->show_all_desks));
+    return ( (!tb->single_window || tk->focused) && ((tk->desktop == ALL_WORKSPACES) || (tk->desktop == tb->current_desktop) || (tb->show_all_desks)) );
 }
 
 /* Recompute the visible task for a class when the class membership changes.
@@ -297,7 +347,7 @@ static void task_draw_label(Task * tk)
 {
     TaskClass * tc = tk->res_class;
     gboolean bold_style = (((tk->entered_state) || (tk->flash_state)) && (tk->tb->flat_button));
-    if ((tk->tb->grouped_tasks) && (tc != NULL) && (tc->visible_task == tk) && (tc->visible_count > 1))
+    if ((tk->tb->grouped_tasks) && (tc != NULL) && (tc->visible_task == tk) && task_class_is_grouped(tk->tb, tc))
 	{
         char * label = g_strdup_printf("(%d) %s", tc->visible_count, tc->visible_name);
         gtk_widget_set_tooltip_text(tk->button, label);
@@ -615,11 +665,7 @@ static GdkPixbuf * _wnck_gdk_pixbuf_get_from_pixmap(Pixmap xpixmap, int width, i
         }
 
         /* Be sure we aren't going to fail due to visual mismatch. */
-#if GTK_CHECK_VERSION(2,22,0)
-        if ((colormap != NULL) && (gdk_visual_get_depth(gdk_colormap_get_visual(colormap)) != depth))
-#else
         if ((colormap != NULL) && (gdk_colormap_get_visual(colormap)->depth != depth))
-#endif
         {
             g_object_unref(G_OBJECT(colormap));
             colormap = NULL;
@@ -919,7 +965,7 @@ static GdkPixbuf * get_wm_icon(Window task_win, int required_width, int required
 static GdkPixbuf * task_update_icon(TaskbarPlugin * tb, Task * tk, Atom source)
 {
     /* Get the icon from the window's hints. */
-    GdkPixbuf * pixbuf = get_wm_icon(tk->win, tb->icon_size - ICON_BUTTON_TRIM, tb->icon_size - ICON_BUTTON_TRIM, source, &tk->image_source);
+    GdkPixbuf * pixbuf = get_wm_icon(tk->win, tb->icon_size, tb->icon_size, source, &tk->image_source);
 
     /* If that fails, and we have no other icon yet, return the fallback icon. */
     if ((pixbuf == NULL)
@@ -940,7 +986,7 @@ static GdkPixbuf * task_update_icon(TaskbarPlugin * tb, Task * tk, Atom source)
 static gboolean flash_window_timeout(Task * tk)
 {
     /* Set state on the button and redraw. */
-    if ( ! tk->tb->flat_button)
+    if ( ! task_button_is_really_flat(tk->tb))
         gtk_widget_set_state(tk->button, tk->flash_state ? GTK_STATE_SELECTED : GTK_STATE_NORMAL);
     task_draw_label(tk);
 
@@ -954,7 +1000,7 @@ static void task_set_urgency(Task * tk)
 {
     TaskbarPlugin * tb = tk->tb;
     TaskClass * tc = tk->res_class;
-    if ((tb->grouped_tasks) && (tc != NULL) && (tc->visible_count > 1))
+    if (task_class_is_grouped(tb, tc))
         recompute_group_visibility_for_class(tk->tb, tk->res_class);
     else
     {
@@ -973,7 +1019,7 @@ static void task_clear_urgency(Task * tk)
 {
     TaskbarPlugin * tb = tk->tb;
     TaskClass * tc = tk->res_class;
-    if ((tb->grouped_tasks) && (tc != NULL) && (tc->visible_count > 1))
+    if (task_class_is_grouped(tb, tc))
         recompute_group_visibility_for_class(tk->tb, tk->res_class);
     else
     {
@@ -989,6 +1035,12 @@ static void task_clear_urgency(Task * tk)
         flash_window_timeout(tk);
         tk->flash_state = FALSE;
     }
+}
+
+/* Close task window. */
+static void task_close(Task * tk)
+{
+    Xclimsgwm(tk->win, a_WM_PROTOCOLS, a_WM_DELETE_WINDOW);
 }
 
 /* Do the proper steps to raise a window.
@@ -1063,9 +1115,33 @@ static void task_group_menu_destroy(TaskbarPlugin * tb)
  * or "activate" event from grouped-task popup menu item. */
 static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * event, Task * tk, gboolean popup_menu)
 {
+    gboolean event_in_close_button = FALSE;
+    if (!popup_menu && tk->tb->_show_close_buttons && tk->button_close) {
+        // FIXME: какой нормальный способ узнать, находится ли мышь в пределах виджета?
+        gint dest_x, dest_y;
+        gtk_widget_translate_coordinates(widget, tk->button_close, event->x, event->y, &dest_x, &dest_y);
+        if (dest_x >= 0 && dest_y >= 0 && dest_x < GTK_WIDGET(tk->button_close)->allocation.width && dest_y <= GTK_WIDGET(tk->button_close)->allocation.height) {
+            event_in_close_button = TRUE;
+        }
+    }
+
+    if (event_in_close_button && event->button == 1) {
+        if (event->type == GDK_BUTTON_PRESS) {
+           tk->click_on = tk->button_close;
+           return TRUE;
+        } else if (event->type == GDK_BUTTON_RELEASE && tk->click_on == tk->button_close) {
+           task_close(tk);
+           return TRUE;
+        }
+    }
+
+   tk->click_on = NULL;
+   if (event_in_close_button || event->type == GDK_BUTTON_RELEASE)
+       return TRUE;
+
     TaskbarPlugin * tb = tk->tb;
     TaskClass * tc = tk->res_class;
-    if ((tb->grouped_tasks) && (tc != NULL) && (tc->visible_count > 1) && (GTK_IS_BUTTON(widget)))
+    if (task_class_is_grouped(tb, tc) && (GTK_IS_BUTTON(widget)))
     {
         /* If this is a grouped-task representative, meaning that there is a class with at least two windows,
          * bring up a popup menu listing all the class members. */
@@ -1096,7 +1172,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
         Task * visible_task = (((tk->res_class == NULL) || ( ! tk->tb->grouped_tasks)) ? tk : tk->res_class->visible_task);
         task_group_menu_destroy(tb);
 
-        if (event->button == 1)
+        if (event->button == 1 && !tb->single_window)
         {
             /* Left button.
              * If the task is iconified, raise it.
@@ -1117,7 +1193,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
                 a_NET_WM_STATE_SHADED,
                 0, 0, 0);
         }
-        else if (event->button == 3)
+        else if (event->button == 3 || (event->button == 1 && tb->single_window))
         {
             /* Right button.  Bring up the window state popup menu. */
             tk->tb->menutask = tk;
@@ -1130,13 +1206,26 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
     }
 
     /* As a matter of policy, avoid showing selected or prelight states on flat buttons. */
-    if (tb->flat_button)
+    if (task_button_is_really_flat(tb))
         gtk_widget_set_state(widget, GTK_STATE_NORMAL);
     return TRUE;
 }
 
 /* Handler for "button-press-event" event from taskbar button. */
 static gboolean taskbar_button_press_event(GtkWidget * widget, GdkEventButton * event, Task * tk)
+{
+    if (event->state & GDK_CONTROL_MASK && event->button == 3) {
+        Plugin* p = tk->tb->plug;
+        GtkMenu* popup = lxpanel_get_panel_menu( p->panel, p, FALSE );
+        gtk_menu_popup( popup, NULL, NULL, NULL, NULL, event->button, event->time );
+        return TRUE;
+    }
+
+    return taskbar_task_control_event(widget, event, tk, FALSE);
+}
+
+/* Handler for "button-release-event" event from taskbar button. */
+static gboolean taskbar_button_release_event(GtkWidget * widget, GdkEventButton * event, Task * tk)
 {
     return taskbar_task_control_event(widget, event, tk, FALSE);
 }
@@ -1182,7 +1271,7 @@ static void taskbar_button_drag_leave(GtkWidget * widget, GdkDragContext * drag_
 static void taskbar_button_enter(GtkWidget * widget, Task * tk)
 {
     tk->entered_state = TRUE;
-    if (tk->tb->flat_button)
+    if (task_button_is_really_flat(tk->tb))
         gtk_widget_set_state(widget, GTK_STATE_NORMAL);
     task_draw_label(tk);
 }
@@ -1200,7 +1289,7 @@ static gboolean taskbar_button_scroll_event(GtkWidget * widget, GdkEventScroll *
     TaskbarPlugin * tb = tk->tb;
     TaskClass * tc = tk->res_class;
     if ((tb->use_mouse_wheel)
-    && (( ! tb->grouped_tasks) || (tc == NULL) || (tc->visible_count == 1)))
+    && (task_class_is_grouped(tb, tc)))
     {
         if ((event->direction == GDK_SCROLL_UP) || (event->direction == GDK_SCROLL_LEFT))
             task_raise_window(tk, event->time);
@@ -1217,12 +1306,7 @@ static void taskbar_button_size_allocate(GtkWidget * btn, GtkAllocation * alloc,
     {
         /* Get the coordinates of the button. */
         int x, y;
-#if GTK_CHECK_VERSION(2,22,0)
-        gdk_window_get_origin(gtk_button_get_event_window(GTK_BUTTON(btn)), &x, &y);
-#else
         gdk_window_get_origin(GTK_BUTTON(btn)->event_window, &x, &y);
-#endif
-
 
         /* Send a NET_WM_ICON_GEOMETRY property change on the window. */
         guint32 data[4];
@@ -1241,19 +1325,32 @@ static void taskbar_update_style(TaskbarPlugin * tb)
 {
     GtkOrientation bo = (tb->plug->panel->orientation == ORIENT_HORIZ) ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL;
     icon_grid_set_geometry(tb->icon_grid, bo,
-        ((tb->icons_only) ? tb->icon_size + ICON_ONLY_EXTRA : tb->task_width_max), tb->icon_size,
+        get_task_button_max_width(tb), tb->icon_size + BUTTON_HEIGHT_EXTRA,
         tb->spacing, 0, tb->plug->panel->height);
 }
 
 /* Update style on a task button when created or after a configuration change. */
 static void task_update_style(Task * tk, TaskbarPlugin * tb)
 {
-    if (tb->icons_only)
-        gtk_widget_hide(tk->label);
-    else
+    if (tb->show_titles)
         gtk_widget_show(tk->label);
+    else
+        gtk_widget_hide(tk->label);
 
-    if( tb->flat_button )
+    if (tb->show_icons)
+        gtk_widget_show(tk->image);
+    else
+        gtk_widget_hide(tk->image);
+
+    if (tb->_show_close_buttons) {
+        if (!tk->button_close)
+            task_build_gui_button_close(tb, tk);
+        gtk_widget_show(tk->button_close);
+    } else if (tk->button_close){
+        gtk_widget_hide(tk->button_close);
+    }
+
+    if( task_button_is_really_flat(tb) )
     {
         gtk_toggle_button_set_active((GtkToggleButton*)tk->button, FALSE);
         gtk_button_set_relief(GTK_BUTTON(tk->button), GTK_RELIEF_NONE);
@@ -1265,6 +1362,29 @@ static void task_update_style(Task * tk, TaskbarPlugin * tb)
     }
 
     task_draw_label(tk);
+}
+
+/* Build close button for a task button. */
+static void task_build_gui_button_close(TaskbarPlugin * tb, Task* tk)
+{
+    /* Create box for close button. */
+    GtkWidget * box = gtk_vbox_new(FALSE, 1);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 0);
+
+    /* Create close button. */
+    tk->button_close = gtk_image_new_from_stock (GTK_STOCK_CLOSE, GTK_ICON_SIZE_MENU);
+    gtk_box_pack_end(GTK_BOX(box), tk->button_close, TRUE, FALSE, 0);
+    gtk_widget_set_tooltip_text (tk->button_close, _("Close window"));
+    gtk_widget_show(tk->button_close);
+
+    gtk_box_pack_end(GTK_BOX(tk->container), box, FALSE, FALSE, 0);
+    gtk_widget_show(box);
+
+    if (tb->extra_size == 0) {
+        GtkRequisition r;
+        gtk_widget_size_request(tk->button_close, &r);
+        tb->extra_size = r.width;
+    }
 }
 
 /* Build graphic elements needed for a task button. */
@@ -1286,6 +1406,7 @@ static void task_build_gui(TaskbarPlugin * tb, Task * tk)
 
     /* Connect signals to the button. */
     g_signal_connect(tk->button, "button_press_event", G_CALLBACK(taskbar_button_press_event), (gpointer) tk);
+    g_signal_connect(tk->button, "button_release_event", G_CALLBACK(taskbar_button_release_event), (gpointer) tk);
     g_signal_connect(G_OBJECT(tk->button), "drag-motion", G_CALLBACK(taskbar_button_drag_motion), (gpointer) tk);
     g_signal_connect(G_OBJECT(tk->button), "drag-leave", G_CALLBACK(taskbar_button_drag_leave), (gpointer) tk);
     g_signal_connect_after(G_OBJECT (tk->button), "enter", G_CALLBACK(taskbar_button_enter), (gpointer) tk);
@@ -1294,8 +1415,8 @@ static void task_build_gui(TaskbarPlugin * tb, Task * tk)
     g_signal_connect(tk->button, "size-allocate", G_CALLBACK(taskbar_button_size_allocate), (gpointer) tk);
 
     /* Create a box to contain the application icon and window title. */
-    GtkWidget * container = gtk_hbox_new(FALSE, 1);
-    gtk_container_set_border_width(GTK_CONTAINER(container), 0);
+    tk->container = gtk_hbox_new(FALSE, 1);
+    gtk_container_set_border_width(GTK_CONTAINER(tk->container), 0);
 
     /* Create an image to contain the application icon and add it to the box. */
     GdkPixbuf* pixbuf = task_update_icon(tb, tk, None);
@@ -1303,28 +1424,26 @@ static void task_build_gui(TaskbarPlugin * tb, Task * tk)
     gtk_misc_set_padding(GTK_MISC(tk->image), 0, 0);
     g_object_unref(pixbuf);
     gtk_widget_show(tk->image);
-    gtk_box_pack_start(GTK_BOX(container), tk->image, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tk->container), tk->image, FALSE, FALSE, 0);
 
     /* Create a label to contain the window title and add it to the box. */
     tk->label = gtk_label_new(NULL);
     gtk_misc_set_alignment(GTK_MISC(tk->label), 0.0, 0.5);
     gtk_label_set_ellipsize(GTK_LABEL(tk->label), PANGO_ELLIPSIZE_END);
-    gtk_box_pack_start(GTK_BOX(container), tk->label, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(tk->container), tk->label, TRUE, TRUE, 0);
+
+    if (tb->_show_close_buttons)
+        task_build_gui_button_close(tb, tk);
 
     /* Add the box to the button. */
-    gtk_widget_show(container);
-    gtk_container_add(GTK_CONTAINER(tk->button), container);
+    gtk_widget_show(tk->container);
+    gtk_container_add(GTK_CONTAINER(tk->button), tk->container);
     gtk_container_set_border_width(GTK_CONTAINER(tk->button), 0);
 
     /* Add the button to the taskbar. */
-    icon_grid_add(tb->icon_grid, tk->button, TRUE);
-#if GTK_CHECK_VERSION(2,18,0)
-    gtk_widget_set_can_focus(GTK_WIDGET(tk->button),FALSE);
-    gtk_widget_set_can_default(GTK_WIDGET(tk->button),FALSE);
-#else
+    icon_grid_add(tb->icon_grid, tk->button, FALSE);
     GTK_WIDGET_UNSET_FLAGS(tk->button, GTK_CAN_FOCUS);
     GTK_WIDGET_UNSET_FLAGS(tk->button, GTK_CAN_DEFAULT);
-#endif
 
     /* Update styles on the button. */
     task_update_style(tk, tb);
@@ -1332,6 +1451,37 @@ static void task_build_gui(TaskbarPlugin * tb, Task * tk)
     /* Flash button for window with urgency hint. */
     if (tk->urgency)
         task_set_urgency(tk);
+}
+
+static void task_reorder(Task * tk)
+{
+    if (!tk->tb->group_side_by_side)
+        return;
+
+    Task* tk_prev_old = NULL;
+    Task* tk_prev_new = NULL;
+    Task* tk_cursor;
+    for (tk_cursor = tk->tb->task_list; tk_cursor != NULL; tk_cursor = tk_cursor->task_flink)
+    {
+         if (tk_cursor == tk)
+             continue;
+         if (tk_cursor->res_class != NULL && tk_cursor->res_class == tk->res_class && (tk_cursor->desktop == tk->desktop || tk->tb->show_all_desks))
+             tk_prev_new = tk_cursor;
+         if (tk_cursor->task_flink == tk)
+             tk_prev_old = tk_cursor;
+    }
+
+    if (tk_prev_new) {
+        if (tk_prev_old != tk_prev_new) {
+            if (tk_prev_old)
+                tk_prev_old->task_flink = tk->task_flink;
+            else
+                tk->tb->task_list = tk->task_flink;
+            tk->task_flink = tk_prev_new->task_flink;
+            tk_prev_new->task_flink = tk;
+        }
+        icon_grid_place_child_after(tk->tb->icon_grid, tk->button, tk_prev_new->button);
+    }
 }
 
 /*****************************************************
@@ -1382,6 +1532,7 @@ static void taskbar_net_client_list(GtkWidget * widget, TaskbarPlugin * tb)
                 {
                     /* Allocate and initialize new task structure. */
                     tk = g_new0(Task, 1);
+                    tk->click_on = NULL;
                     tk->present_in_client_list = TRUE;
                     tk->win = client_list[i];
                     tk->tb = tb;
@@ -1406,6 +1557,8 @@ static void taskbar_net_client_list(GtkWidget * widget, TaskbarPlugin * tb)
                         tk->task_flink = tk_pred->task_flink;
                         tk_pred->task_flink = tk;
                     }
+                    task_reorder(tk);
+                    icon_grid_set_visible(tb->icon_grid, tk->button, TRUE);
                 }
             }
         }
@@ -1501,7 +1654,7 @@ static void taskbar_net_active_window(GtkWidget * widget, TaskbarPlugin * tb)
     {
         ctk->focused = FALSE;
         tb->focused = NULL;
-        if(!tb->flat_button) /* relieve the button if flat buttons is not used. */
+        if(! task_button_is_really_flat(tb)) /* relieve the button if flat buttons is not used. */
             gtk_toggle_button_set_active((GtkToggleButton*)ctk->button, FALSE);
 
         task_button_redraw(ctk, tb);
@@ -1510,7 +1663,7 @@ static void taskbar_net_active_window(GtkWidget * widget, TaskbarPlugin * tb)
     /* If a task gained focus, update data structures. */
     if ((ntk != NULL) && (make_new))
     {
-        if(!tb->flat_button) /* depress the button if flat buttons is not used. */
+        if(! task_button_is_really_flat(tb)) /* depress the button if flat buttons is not used. */
             gtk_toggle_button_set_active((GtkToggleButton*)ntk->button, TRUE);
         ntk->focused = TRUE;
         tb->focused = ntk;
@@ -1575,6 +1728,7 @@ static void taskbar_property_notify_event(TaskbarPlugin *tb, XEvent *ev)
                 {
                     /* Window changed class. */
                     task_set_class(tk);
+                    task_reorder(tk);
                     taskbar_redraw(tb);
                 }
                 else if (at == a_WM_STATE)
@@ -1695,7 +1849,7 @@ static void menu_move_to_workspace(GtkWidget * widget, TaskbarPlugin * tb)
 /* Handler for "activate" event on Close item of right-click menu for task buttons. */
 static void menu_close_window(GtkWidget * widget, TaskbarPlugin * tb)
 {
-    Xclimsgwm(tb->menutask->win, a_WM_PROTOCOLS, a_WM_DELETE_WINDOW);
+    task_close(tb->menutask);
     task_group_menu_destroy(tb);
 }
 
@@ -1811,11 +1965,7 @@ static void taskbar_build_gui(Plugin * p)
     /* Allocate top level widget and set into Plugin widget pointer. */
     p->pwid = gtk_event_box_new();
     gtk_container_set_border_width(GTK_CONTAINER(p->pwid), 0);
-#if GTK_CHECK_VERSION(2,18,0)
-    gtk_widget_set_has_window(GTK_WIDGET(p->pwid),FALSE);
-#else
     GTK_WIDGET_SET_FLAGS(p->pwid, GTK_NO_WINDOW);
-#endif
     gtk_widget_set_name(p->pwid, "taskbar");
 
     /* Make container for task buttons as a child of top level widget. */
@@ -1847,6 +1997,28 @@ static void taskbar_build_gui(Plugin * p)
     g_signal_connect(gtk_widget_get_screen(p->pwid), "window-manager-changed", G_CALLBACK(taskbar_window_manager_changed), tb);
 }
 
+static void taskbar_config_updated(TaskbarPlugin * tb)
+{
+    gboolean group_side_by_side = tb->mode == MODE_GROUP_SIDE_BY_SIDE;
+
+    tb->grouped_tasks = tb->mode == MODE_GROUP_INTO_BUTTON;
+    tb->single_window = tb->mode == MODE_SINGLE_WINDOW;
+
+    tb->show_icons  = tb->show_icons_titles != SHOW_TITLES;
+    tb->show_titles = tb->show_icons_titles != SHOW_ICONS;
+
+    // FIXME: В некоторых случаях использование режима MODE_SINGLE_WINDOW с tb->group_side_by_side == TRUE приводит к тому, что кнопка активного окна не отображается.
+    // Поэтому пришлось включить сюда проверку tb->mode == MODE_SINGLE_WINDOW
+    tb->rebuild_gui = group_side_by_side != tb->group_side_by_side && (tb->mode == MODE_CLASSIC || tb->mode == MODE_GROUP_SIDE_BY_SIDE || tb->mode == MODE_SINGLE_WINDOW);
+    tb->rebuild_gui |= tb->show_all_desks && tb->show_all_desks_prev_value != tb->show_all_desks && tb->mode == MODE_GROUP_SIDE_BY_SIDE;
+    if (tb->rebuild_gui) {
+        tb->group_side_by_side = group_side_by_side;
+        tb->show_all_desks_prev_value = tb->show_all_desks;
+    }
+
+    tb->_show_close_buttons = tb->show_close_buttons && !tb->grouped_tasks;
+}
+
 /* Plugin constructor. */
 static int taskbar_constructor(Plugin * p, char ** fp)
 {
@@ -1858,13 +2030,23 @@ static int taskbar_constructor(Plugin * p, char ** fp)
     /* Initialize to defaults. */
     tb->icon_size         = p->panel->icon_size;
     tb->tooltips          = TRUE;
-    tb->icons_only        = FALSE;
+    tb->show_icons_titles = SHOW_BOTH;
     tb->show_all_desks    = FALSE;
     tb->task_width_max    = TASK_WIDTH_MAX;
     tb->spacing           = 1;
     tb->use_mouse_wheel   = TRUE;
     tb->use_urgency_hint  = TRUE;
+    tb->mode              = MODE_CLASSIC;
+    tb->show_close_buttons = FALSE;
+
     tb->grouped_tasks     = FALSE;
+    tb->single_window     = FALSE;
+    tb->group_side_by_side = FALSE;
+    tb->show_icons        = TRUE;
+    tb->show_titles       = TRUE;
+    tb->show_all_desks_prev_value = FALSE;
+    tb->_show_close_buttons = FALSE;
+    tb->extra_size        = 0;
 
     /* Process configuration file. */
     line s;
@@ -1880,8 +2062,8 @@ static int taskbar_constructor(Plugin * p, char ** fp)
             {
                 if (g_ascii_strcasecmp(s.t[0], "tooltips") == 0)
                     tb->tooltips = str2num(bool_pair, s.t[1], 1);
-                else if (g_ascii_strcasecmp(s.t[0], "IconsOnly") == 0)
-                    tb->icons_only = str2num(bool_pair, s.t[1], 0);
+                else if (g_ascii_strcasecmp(s.t[0], "IconsOnly") == 0)			/* For backward compatibility */
+                    ;
                 else if (g_ascii_strcasecmp(s.t[0], "AcceptSkipPager") == 0)		/* For backward compatibility */
                     ;
                 else if (g_ascii_strcasecmp(s.t[0], "ShowIconified") == 0)		/* For backward compatibility */
@@ -1900,8 +2082,16 @@ static int taskbar_constructor(Plugin * p, char ** fp)
                     tb->use_urgency_hint = str2num(bool_pair, s.t[1], 1);
                 else if (g_ascii_strcasecmp(s.t[0], "FlatButton") == 0)
                     tb->flat_button = str2num(bool_pair, s.t[1], 1);
-                else if (g_ascii_strcasecmp(s.t[0], "GroupedTasks") == 0)
-                    tb->grouped_tasks = str2num(bool_pair, s.t[1], 1);
+                else if (g_ascii_strcasecmp(s.t[0], "GroupedTasks") == 0)		/* For backward compatibility */
+                    ;
+                else if (g_ascii_strcasecmp(s.t[0], "Mode") == 0)
+                    tb->mode = atoi(s.t[1]);
+                else if (g_ascii_strcasecmp(s.t[0], "ShowIconsTitles") == 0)
+                    tb->show_icons_titles = atoi(s.t[1]);
+                else if (g_ascii_strcasecmp(s.t[0], "ShowCloseButtons") == 0)
+                    tb->show_close_buttons = str2num(bool_pair, s.t[1], 0);
+                else if (g_ascii_strcasecmp(s.t[0], "SelfGroupSingleWindow") == 0)
+                    tb->selfgroup_single_window = str2num(bool_pair, s.t[1], 0);
                 else
                     ERR( "taskbar: unknown var %s\n", s.t[0]);
             }
@@ -1913,12 +2103,17 @@ static int taskbar_constructor(Plugin * p, char ** fp)
         }
     }
 
+    taskbar_config_updated(tb);
+
     /* Build the graphic elements. */
     taskbar_build_gui(p);
 
     /* Fetch the client list and redraw the taskbar.  Then determine what window has focus. */
     taskbar_net_client_list(NULL, tb);
     taskbar_net_active_window(NULL, tb);
+
+    taskbar_update_style(tb);
+
     return 1;
 }
 
@@ -1962,6 +2157,20 @@ static void taskbar_apply_configuration(Plugin * p)
 {
     TaskbarPlugin * tb = (TaskbarPlugin *) p->priv;
 
+    taskbar_config_updated(tb);
+
+    if (tb->rebuild_gui) {
+        tb->rebuild_gui = FALSE;
+
+        /* Deallocate task list. */
+        while (tb->task_list != NULL)
+            task_delete(tb, tb->task_list, TRUE);
+
+        /* Fetch the client list and redraw the taskbar.  Then determine what window has focus. */
+        taskbar_net_client_list(NULL, tb);
+        taskbar_net_active_window(NULL, tb);
+    }
+
     /* Update style on taskbar. */
     taskbar_update_style(tb);
 
@@ -1984,14 +2193,16 @@ static void taskbar_configure(Plugin * p, GtkWindow * parent)
         GTK_WIDGET(parent),
         (GSourceFunc) taskbar_apply_configuration, (gpointer) p,
         _("Show tooltips"), &tb->tooltips, CONF_TYPE_BOOL,
-        _("Icons only"), &tb->icons_only, CONF_TYPE_BOOL,
+        _("|Show:|Icons only|Titles only|Icons and titles"), &tb->show_icons_titles, CONF_TYPE_ENUM,
+        _("Show close buttons"), &tb->show_close_buttons, CONF_TYPE_BOOL,
+        _("Create groups for \"alone\" windows"), &tb->selfgroup_single_window, CONF_TYPE_BOOL,
         _("Flat buttons"), &tb->flat_button, CONF_TYPE_BOOL,
         _("Show windows from all desktops"), &tb->show_all_desks, CONF_TYPE_BOOL,
         _("Use mouse wheel"), &tb->use_mouse_wheel, CONF_TYPE_BOOL,
         _("Flash when there is any window requiring attention"), &tb->use_urgency_hint, CONF_TYPE_BOOL,
-        _("Combine multiple application windows into a single button"), &tb->grouped_tasks, CONF_TYPE_BOOL,
         _("Maximum width of task button"), &tb->task_width_max, CONF_TYPE_INT,
         _("Spacing"), &tb->spacing, CONF_TYPE_INT,
+        _("|Mode|Classic|Group similar windows side by side|Group similar windows into one button|Show only active window"), &tb->mode, CONF_TYPE_ENUM,
         NULL);
     gtk_window_present(GTK_WINDOW(dlg));
 }
@@ -2001,14 +2212,16 @@ static void taskbar_save_configuration(Plugin * p, FILE * fp)
 {
     TaskbarPlugin * tb = (TaskbarPlugin *) p->priv;
     lxpanel_put_bool(fp, "tooltips", tb->tooltips);
-    lxpanel_put_bool(fp, "IconsOnly", tb->icons_only);
+    lxpanel_put_int(fp, "ShowIconsTitles", tb->show_icons_titles);
     lxpanel_put_bool(fp, "ShowAllDesks", tb->show_all_desks);
     lxpanel_put_bool(fp, "UseMouseWheel", tb->use_mouse_wheel);
     lxpanel_put_bool(fp, "UseUrgencyHint", tb->use_urgency_hint);
     lxpanel_put_bool(fp, "FlatButton", tb->flat_button);
     lxpanel_put_int(fp, "MaxTaskWidth", tb->task_width_max);
     lxpanel_put_int(fp, "spacing", tb->spacing);
-    lxpanel_put_bool(fp, "GroupedTasks", tb->grouped_tasks);
+    lxpanel_put_int(fp, "Mode", tb->mode);
+    lxpanel_put_bool(fp, "ShowCloseButtons", tb->show_close_buttons);
+    lxpanel_put_bool(fp, "SelfGroupSingleWindow", tb->selfgroup_single_window);
 }
 
 /* Callback when panel configuration changes. */
@@ -2017,6 +2230,10 @@ static void taskbar_panel_configuration_changed(Plugin * p)
     TaskbarPlugin * tb = (TaskbarPlugin *) p->priv;
     taskbar_update_style(tb);
     taskbar_make_menu(tb);
+    GtkOrientation bo = (tb->plug->panel->orientation == ORIENT_HORIZ) ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL;
+    icon_grid_set_geometry(tb->icon_grid, bo,
+        get_task_button_max_width(tb), tb->plug->panel->icon_size + BUTTON_HEIGHT_EXTRA,
+        tb->spacing, 0, tb->plug->panel->height);
 
     /* If the icon size changed, refetch all the icons. */
     if (tb->plug->panel->icon_size != tb->icon_size)
