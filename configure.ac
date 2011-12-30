@@ -55,15 +55,22 @@ PKG_CHECK_MODULES(WNCK, [$pkg_modules])
 AC_SUBST(WNCK_CFLAGS)
 AC_SUBST(WNCK_LIBS)
 
-pkg_modules="libmenu-cache"
-PKG_CHECK_MODULES(MENU_CACHE, [$pkg_modules],
-		  enable_menu_cache=yes, enable_menu_cache=no)
-if test x"$enable_menu_cache" = "xno"; then
-	AC_WARN([No libmenu-cache found.  All menu related routines are not built.])
+AC_ARG_WITH(menucache, [  --without-menucache     Compile without menucache support])
+if test "x$with_menucache" != "xno"; then
+	pkg_modules="libmenu-cache"
+	PKG_CHECK_MODULES(MENU_CACHE, [$pkg_modules],
+			  enable_menu_cache=yes, enable_menu_cache=no)
+	if test x"$enable_menu_cache" = "xno"; then
+		AC_WARN([No libmenu-cache found.  All menu related routines are not built.])
+		AC_DEFINE(DISABLE_MENU, [1], [Disable menu related routines])
+	fi
+	AC_SUBST(MENU_CACHE_CFLAGS)
+	AC_SUBST(MENU_CACHE_LIBS)
+else
+	enable_menu_cache=no
+	AC_WARN([libmenu-cache disabled.  All menu related routines are not built.])
 	AC_DEFINE(DISABLE_MENU, [1], [Disable menu related routines])
 fi
-AC_SUBST(MENU_CACHE_CFLAGS)
-AC_SUBST(MENU_CACHE_LIBS)
 AM_CONDITIONAL(ENABLE_MENU_CACHE, test x"$enable_menu_cache" = x"yes")
 
 AC_ARG_ENABLE(more_warnings,
