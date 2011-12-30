@@ -162,11 +162,11 @@ static pair sort_by_pair[] = {
 
 /******************************************************************************/
 
-/* Structure representing a class.  This comes from WM_CLASS, and should identify windows that come from an application. */
+/* Structure representing a class. */
 typedef struct _task_class {
-    struct _task_class * res_class_flink;	/* Forward link */
-    char * res_class;				/* Class name */
-    struct _task * res_class_head;		/* Head of list of tasks with this class */
+    struct _task_class * task_class_flink;	/* Forward link */
+    char * class_name;				/* Class name */
+    struct _task * task_class_head;		/* Head of list of tasks with this class */
     struct _task * visible_task;		/* Task that is visible in current desktop, if any */
     char * visible_name;			/* Name that will be visible for grouped tasks */
     int visible_count;				/* Count of tasks that are visible in current desktop */
@@ -190,8 +190,8 @@ typedef struct _task {
     gboolean name_changed;
 
     
-    TaskClass * res_class;			/* Class, from WM_CLASS */
-    struct _task * res_class_flink;		/* Forward link to task in same class */
+    TaskClass * task_class;			/* Task class (group) */
+    struct _task * task_class_flink;		/* Forward link to task in same class */
     char * override_class_name;
 
 
@@ -237,7 +237,7 @@ typedef struct _taskbar {
 
     Plugin * plug;				/* Back pointer to Plugin */
     Task * task_list;				/* List of tasks to be displayed in taskbar */
-    TaskClass * res_class_list;			/* Window class list */
+    TaskClass * task_class_list;		/* Window class list */
     IconGrid * icon_grid;			/* Manager for taskbar buttons */
 
     int task_timestamp;                         /* To sort tasks and task classes by creation time. */
@@ -371,20 +371,26 @@ static gchar *taskbar_rc = "style 'taskbar-style'\n"
 #define BUTTON_HEIGHT_EXTRA  4          /* Amount needed to have button not clip icon */
 
 static void set_timer_on_task(Task * tk);
+
 static gboolean task_is_visible_on_current_desktop(Task * tk);
+static gboolean task_is_visible_on_desktop(Task * tk, int desktop);
+
+static gboolean task_is_visible(Task * tk);
+
 static void recompute_group_visibility_for_class(TaskbarPlugin * tb, TaskClass * tc);
 static void recompute_group_visibility_on_current_desktop(TaskbarPlugin * tb);
+
 static void task_draw_label(Task * tk);
-static gboolean task_is_visible(Task * tk);
 static void task_button_redraw(Task * tk);
 static void taskbar_redraw(TaskbarPlugin * tb);
+
 static gboolean accept_net_wm_state(NetWMState * nws);
 static gboolean accept_net_wm_window_type(NetWMWindowType * nwwt);
 static void task_free_names(Task * tk);
 static void task_set_names(Task * tk, Atom source);
 
 static void task_unlink_class(Task * tk);
-static TaskClass * taskbar_enter_res_class(TaskbarPlugin * tb, char * res_class, gboolean * name_consumed);
+static TaskClass * taskbar_enter_class(TaskbarPlugin * tb, char * class_name, gboolean * name_consumed);
 static void task_set_class(Task * tk);
 
 static Task * task_lookup(TaskbarPlugin * tb, Window win);
@@ -461,7 +467,11 @@ static void set_timer_on_task(Task * tk)
     tk->flash_timeout = g_timeout_add(interval, (GSourceFunc) flash_window_timeout, tk);
 }
 
-static int get_task_button_max_width(TaskbarPlugin * tb)
+/******************************************************************************/
+
+/* Taskbar internal options and properties. */
+
+static int taskbar_get_task_button_max_width(TaskbarPlugin * tb)
 {
     int icon_mode_max_width = tb->icon_size + ICON_ONLY_EXTRA + (tb->_show_close_buttons ? tb->extra_size : 0);
     if (tb->show_titles && tb->task_width_max > icon_mode_max_width) {
@@ -471,25 +481,13 @@ static int get_task_button_max_width(TaskbarPlugin * tb)
     }
 }
 
-static gboolean get_task_button_expandable(TaskbarPlugin * tb) {
+static gboolean taskbar_task_button_is_expandable(TaskbarPlugin * tb) {
         return tb->single_window || tb->task_width_max < 1;
 }
 
-static int task_button_is_really_flat(TaskbarPlugin * tb)
+static int taskbar_task_button_is_really_flat(TaskbarPlugin * tb)
 {
     return ( tb->single_window || tb->flat_button );
-}
-
-static char* task_get_displayed_name(Task * tk)
-{
-    if (tk->iconified) {
-        if (!tk->name_iconified) {
-            tk->name_iconified = g_strdup_printf("[%s]", tk->name);
-        }
-        return tk->name_iconified;
-    } else {
-        return tk->name;
-    }
 }
 
 static gchar* taskbar_get_desktop_name(TaskbarPlugin * tb, int desktop, const char* defval)
@@ -506,10 +504,18 @@ static gchar* taskbar_get_desktop_name(TaskbarPlugin * tb, int desktop, const ch
     return name;
 }
 
-static gchar* task_get_desktop_name(Task * tk, const char* defval)
+static gboolean taskbar_has_visible_tasks_on_desktop(TaskbarPlugin * tb, int desktop)
 {
-    return taskbar_get_desktop_name(tk->tb, tk->desktop, defval);
+    Task * tk;
+    for (tk = tb->task_list; tk != NULL; tk = tk->task_flink)
+        if (task_is_visible_on_desktop(tk,  desktop))
+            return TRUE;
+    return FALSE;
 }
+
+/******************************************************************************/
+
+/* Task class getters. */
 
 static int task_class_is_folded(TaskbarPlugin * tb, TaskClass * tc)
 {
@@ -519,16 +525,37 @@ static int task_class_is_folded(TaskbarPlugin * tb, TaskClass * tc)
     if (tc && tc->manual_unfold_state)
         return !tc->unfold;
 
-    if ((tb->_unfold_focused_group || tb->_show_single_group) && tb->focused && tb->focused->res_class == tc)
+    if ((tb->_unfold_focused_group || tb->_show_single_group) && tb->focused && tb->focused->task_class == tc)
         return FALSE;
 
     int visible_count = tc ? tc->visible_count : 1;
     return (tb->_group_fold_threshold > 0) && (visible_count >= tb->_group_fold_threshold);
 }
 
+/******************************************************************************/
+
+/* Task getters. */
+
+static char* task_get_displayed_name(Task * tk)
+{
+    if (tk->iconified) {
+        if (!tk->name_iconified) {
+            tk->name_iconified = g_strdup_printf("[%s]", tk->name);
+        }
+        return tk->name_iconified;
+    } else {
+        return tk->name;
+    }
+}
+
+static gchar* task_get_desktop_name(Task * tk, const char* defval)
+{
+    return taskbar_get_desktop_name(tk->tb, tk->desktop, defval);
+}
+
 static int task_is_folded(Task * tk)
 {
-    return task_class_is_folded(tk->tb, tk->res_class);
+    return task_class_is_folded(tk->tb, tk->task_class);
 }
 
 static gboolean task_has_visible_close_button(Task * tk)
@@ -548,14 +575,31 @@ static gboolean task_is_visible_on_current_desktop(Task * tk)
     return task_is_visible_on_desktop(tk, tk->tb->current_desktop);
 }
 
-static gboolean taskbar_has_visible_tasks_on_desktop(TaskbarPlugin * tb, int desktop)
+/* Determine if a task is visible. */
+static gboolean task_is_visible(Task * tk)
 {
-    Task * tk;
-    for (tk = tb->task_list; tk != NULL; tk = tk->task_flink)
-        if (task_is_visible_on_desktop(tk,  desktop))
-            return TRUE;
-    return FALSE;
+    TaskbarPlugin * tb = tk->tb;
+
+    /* Not visible due to grouping. */
+    if (task_is_folded(tk) && (tk->task_class) && (tk->task_class->visible_task != tk))
+        return FALSE;
+
+    /* In single_window mode only focused task is visible. */
+    if (tb->single_window && !tk->focused)
+        return FALSE;
+
+    if (tb->_show_single_group && !tk->focused && (!tk->task_class || !tb->focused || tb->focused->task_class != tk->task_class))
+        return FALSE;
+
+    /* Hide iconified or mapped tasks? */
+    if (!tb->single_window && !((tk->iconified && tb->show_iconified) || (!tk->iconified && tb->show_mapped)) )
+        return FALSE;
+
+    /* Desktop placement. */
+    return task_is_visible_on_current_desktop(tk);
 }
+
+/******************************************************************************/
 
 /* Recompute the visible task for a class when the class membership changes.
  * Also transfer the urgency state to the visible task if necessary. */
@@ -576,7 +620,7 @@ static void recompute_group_visibility_for_class(TaskbarPlugin * tb, TaskClass *
     Task * visible_task_candidate = NULL;
     int visible_task_prio = 0;
 
-    for (tk = tc->res_class_head; tk != NULL; tk = tk->res_class_flink)
+    for (tk = tc->task_class_head; tk != NULL; tk = tk->task_class_flink)
     {
         if (task_is_visible_on_current_desktop(tk))
         {
@@ -601,10 +645,10 @@ static void recompute_group_visibility_for_class(TaskbarPlugin * tb, TaskClass *
              * Note that the visible name is not a separate string, but is set to point to one of the others. */
             if (tc->visible_name == NULL)
                 tc->visible_name = tk->name;
-            else if ((tc->visible_name != tc->res_class)
+            else if ((tc->visible_name != tc->class_name)
             && (tc->visible_name != NULL) && (tk->name != NULL)
             && (strcmp(tc->visible_name, tk->name) != 0))
-                tc->visible_name = tc->res_class;
+                tc->visible_name = tc->class_name;
         }
     }
 
@@ -655,16 +699,18 @@ static void recompute_group_visibility_for_class(TaskbarPlugin * tb, TaskClass *
 static void recompute_group_visibility_on_current_desktop(TaskbarPlugin * tb)
 {
     TaskClass * tc;
-    for (tc = tb->res_class_list; tc != NULL; tc = tc->res_class_flink)
+    for (tc = tb->task_class_list; tc != NULL; tc = tc->task_class_flink)
     {
         recompute_group_visibility_for_class(tb, tc);
     }
 }
 
+/******************************************************************************/
+
 /* Draw the label and tooltip on a taskbar button. */
 static void task_draw_label(Task * tk)
 {
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
     gboolean bold_style = (((tk->entered_state) || (tk->flash_state)) && (tk->tb->flat_button));
     bold_style |= tk->name_changed && tk->tb->highlight_modified_titles;
     if (task_is_folded(tk) && (tc) && (tc->visible_task == tk))
@@ -672,7 +718,7 @@ static void task_draw_label(Task * tk)
         char * label = g_strdup_printf("(%d) %s", tc->visible_count, tc->visible_name);
         gtk_widget_set_tooltip_text(tk->button, label);
         if (tk->label)
-            panel_draw_label_text(tk->tb->plug->panel, tk->label, label, bold_style, task_button_is_really_flat(tk->tb));
+            panel_draw_label_text(tk->tb->plug->panel, tk->label, label, bold_style, taskbar_task_button_is_really_flat(tk->tb));
         g_free(label);
     }
     else
@@ -681,37 +727,13 @@ static void task_draw_label(Task * tk)
         if (tk->tb->tooltips)
             gtk_widget_set_tooltip_text(tk->button, name);
         if (tk->label)
-            panel_draw_label_text(tk->tb->plug->panel, tk->label, name, bold_style, task_button_is_really_flat(tk->tb));
+            panel_draw_label_text(tk->tb->plug->panel, tk->label, name, bold_style, taskbar_task_button_is_really_flat(tk->tb));
     }
-}
-
-/* Determine if a task is visible. */
-static gboolean task_is_visible(Task * tk)
-{
-    TaskbarPlugin * tb = tk->tb;
-
-    /* Not visible due to grouping. */
-    if (task_is_folded(tk) && (tk->res_class) && (tk->res_class->visible_task != tk))
-        return FALSE;
-
-    /* In single_window mode only focused task is visible. */
-    if (tb->single_window && !tk->focused)
-        return FALSE;
-
-    if (tb->_show_single_group && !tk->focused && (!tk->res_class || !tb->focused || tb->focused->res_class != tk->res_class))
-        return FALSE;
-
-    /* Hide iconified or mapped tasks? */
-    if (!tb->single_window && !((tk->iconified && tb->show_iconified) || (!tk->iconified && tb->show_mapped)) )
-        return FALSE;
-
-    /* Desktop placement. */
-    return task_is_visible_on_current_desktop(tk);
 }
 
 static void task_button_redraw_button_state(Task * tk, TaskbarPlugin * tb)
 {
-    if( task_button_is_really_flat(tb) )
+    if( taskbar_task_button_is_really_flat(tb) )
     {
         gtk_toggle_button_set_active((GtkToggleButton*)tk->button, FALSE);
         gtk_button_set_relief(GTK_BUTTON(tk->button), GTK_RELIEF_NONE);
@@ -768,6 +790,8 @@ static void taskbar_redraw(TaskbarPlugin * tb)
     icon_grid_resume_updates(tb->icon_grid);
 }
 
+/******************************************************************************/
+
 /* Determine if a task should be visible given its NET_WM_STATE. */
 static gboolean accept_net_wm_state(NetWMState * nws)
 {
@@ -779,6 +803,8 @@ static gboolean accept_net_wm_window_type(NetWMWindowType * nwwt)
 {
     return ( ! ((nwwt->desktop) || (nwwt->dock) || (nwwt->splash)));
 }
+
+/******************************************************************************/
 
 /* Free the names associated with a task. */
 static void task_free_names(Task * tk)
@@ -832,10 +858,10 @@ static void task_set_names(Task * tk, Atom source)
 
         tk->name_changed = !tk->focused;
 
-        /* Update tk->res_class->visible_name as it may point to freed tk->name. */
-        if (tk->res_class && tk->tb)
+        /* Update tk->task_class->visible_name as it may point to freed tk->name. */
+        if (tk->task_class && tk->tb)
         {
-            recompute_group_visibility_for_class(tk->tb, tk->res_class);
+            recompute_group_visibility_for_class(tk->tb, tk->task_class);
         }
 
         /* Redraw the button. */
@@ -851,22 +877,22 @@ static void task_set_names(Task * tk, Atom source)
 static void task_unlink_class(Task * tk)
 {
     ENTER;
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
     if (tc != NULL)
     {
-        tk->res_class = NULL;
+        tk->task_class = NULL;
 
         if (tc->visible_task == tk)
             tc->visible_task = NULL;
 
         /* Remove from per-class task list. */
-        if (tc->res_class_head == tk)
+        if (tc->task_class_head == tk)
         {
             /* Removing the head of the list.  This causes a new task to be the visible task, so we redraw. */
-            tc->res_class_head = tk->res_class_flink;
-            tk->res_class_flink = NULL;
-            if (tc->res_class_head != NULL)
-                task_button_redraw(tc->res_class_head);
+            tc->task_class_head = tk->task_class_flink;
+            tk->task_class_flink = NULL;
+            if (tc->task_class_head != NULL)
+                task_button_redraw(tc->task_class_head);
         }
         else
         {
@@ -874,12 +900,12 @@ static void task_unlink_class(Task * tk)
             Task * tk_pred = NULL;
             Task * tk_cursor;
             for (
-              tk_cursor = tc->res_class_head;
+              tk_cursor = tc->task_class_head;
               ((tk_cursor != NULL) && (tk_cursor != tk));
-              tk_pred = tk_cursor, tk_cursor = tk_cursor->res_class_flink) ;
+              tk_pred = tk_cursor, tk_cursor = tk_cursor->task_class_flink) ;
             if (tk_cursor == tk)
-                tk_pred->res_class_flink = tk->res_class_flink;
-            tk->res_class_flink = NULL;
+                tk_pred->task_class_flink = tk->task_class_flink;
+            tk->task_class_flink = NULL;
         }
 
         /* Recompute group visibility. */
@@ -889,16 +915,16 @@ static void task_unlink_class(Task * tk)
 }
 
 /* Enter class with specified name. */
-static TaskClass * taskbar_enter_res_class(TaskbarPlugin * tb, char * res_class, gboolean * name_consumed)
+static TaskClass * taskbar_enter_class(TaskbarPlugin * tb, char * class_name, gboolean * name_consumed)
 {
     ENTER;
     /* Find existing entry or insertion point. */
     *name_consumed = FALSE;
     TaskClass * tc_pred = NULL;
     TaskClass * tc;
-    for (tc = tb->res_class_list; tc != NULL; tc_pred = tc, tc = tc->res_class_flink)
+    for (tc = tb->task_class_list; tc != NULL; tc_pred = tc, tc = tc->task_class_flink)
     {
-        int status = strcmp(res_class, tc->res_class);
+        int status = strcmp(class_name, tc->class_name);
         if (status == 0)
             RET(tc);
         if (status < 0)
@@ -907,17 +933,17 @@ static TaskClass * taskbar_enter_res_class(TaskbarPlugin * tb, char * res_class,
 
     /* Insert new entry. */
     tc = g_new0(TaskClass, 1);
-    tc->res_class = res_class;
+    tc->class_name = class_name;
     *name_consumed = TRUE;
     if (tc_pred == NULL)
     {
-        tc->res_class_flink = tb->res_class_list;
-        tb->res_class_list = tc;
+        tc->task_class_flink = tb->task_class_list;
+        tb->task_class_list = tc;
     }
     else
     {
-        tc->res_class_flink = tc_pred->res_class_flink;
-	tc_pred->res_class_flink = tc;
+        tc->task_class_flink = tc_pred->task_class_flink;
+	tc_pred->task_class_flink = tc;
     }
     RET(tc);
 }
@@ -956,18 +982,18 @@ static void task_set_class(Task * tk)
 
     g_assert(tk != NULL);
 
-    gchar * res_class = NULL;
+    gchar * class_name = NULL;
     
     if (tk->override_class_name != (char*) -1) {
-         res_class = g_strdup(tk->override_class_name);
+         class_name = g_strdup(tk->override_class_name);
     } else {
         switch (tk->tb->_group_by) {
             case GROUP_BY_CLASS:
-                res_class = task_get_res_class(tk); break;
+                class_name = task_get_res_class(tk); break;
             case GROUP_BY_WORKSPACE:
-                res_class = task_get_desktop_name(tk, NULL); break;
+                class_name = task_get_desktop_name(tk, NULL); break;
             case GROUP_BY_STATE:
-                res_class = g_strdup(
+                class_name = g_strdup(
                     (tk->urgency) ? _("Urgency") : 
                     (tk->iconified) ? _("Iconified") : 
                     _("Mapped")
@@ -976,16 +1002,17 @@ static void task_set_class(Task * tk)
         }
     }
 
-    if (res_class != NULL)
+    if (class_name != NULL)
     {
-        DBG("Task %s has res_class %s\n", tk->name, res_class);
+        DBG("Task %s has class name %s\n", tk->name, class_name);
 
         gboolean name_consumed;
-        TaskClass * tc = taskbar_enter_res_class(tk->tb, res_class, &name_consumed);
-        if ( ! name_consumed) g_free(res_class);
+        TaskClass * tc = taskbar_enter_class(tk->tb, class_name, &name_consumed);
+        if ( ! name_consumed)
+            g_free(class_name);
 
         /* If the task changed class, update data structures. */
-        TaskClass * old_tc = tk->res_class;
+        TaskClass * old_tc = tk->task_class;
         if (old_tc != tc)
         {
             /* Unlink from previous class, if any. */
@@ -996,17 +1023,17 @@ static void task_set_class(Task * tk)
                 tc->timestamp = tk->timestamp;
 
             /* Add to end of per-class task list.  Do this to keep the popup menu in order of creation. */
-            if (tc->res_class_head == NULL)
-                tc->res_class_head = tk;
+            if (tc->task_class_head == NULL)
+                tc->task_class_head = tk;
             else
             {
                 Task * tk_pred;
-                for (tk_pred = tc->res_class_head; tk_pred->res_class_flink != NULL; tk_pred = tk_pred->res_class_flink) ;
-                tk_pred->res_class_flink = tk;
-                g_assert(tk->res_class_flink == NULL);
+                for (tk_pred = tc->task_class_head; tk_pred->task_class_flink != NULL; tk_pred = tk_pred->task_class_flink) ;
+                tk_pred->task_class_flink = tk;
+                g_assert(tk->task_class_flink == NULL);
                 task_button_redraw(tk);
             }
-            tk->res_class = tc;
+            tk->task_class = tc;
 
             /* Recompute group visibility. */
             recompute_group_visibility_for_class(tk->tb, tc);
@@ -1487,7 +1514,7 @@ static gboolean task_update_icon_cb(Task * tk)
 static gboolean flash_window_timeout(Task * tk)
 {
     /* Set state on the button and redraw. */
-    if ( ! task_button_is_really_flat(tk->tb))
+    if ( ! taskbar_task_button_is_really_flat(tk->tb))
         gtk_widget_set_state(tk->button, tk->flash_state ? GTK_STATE_SELECTED : GTK_STATE_NORMAL);
     task_draw_label(tk);
 
@@ -1500,7 +1527,7 @@ static gboolean flash_window_timeout(Task * tk)
 static void task_set_urgency(Task * tk)
 {
     TaskbarPlugin * tb = tk->tb;
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
     if (task_is_folded(tk))
         recompute_group_visibility_for_class(tk->tb, tc);
     else
@@ -1519,7 +1546,7 @@ static void task_set_urgency(Task * tk)
 static void task_clear_urgency(Task * tk)
 {
     TaskbarPlugin * tb = tk->tb;
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
     if (task_is_folded(tk))
         recompute_group_visibility_for_class(tk->tb, tc);
     else
@@ -1652,7 +1679,7 @@ static void task_show_window_list_helper(Task * tk_cursor, GtkWidget * menu, Tas
 static void task_show_window_list(Task * tk, GdkEventButton * event, gboolean similar)
 {
     TaskbarPlugin * tb = tk->tb;
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
 
     GtkWidget * menu = gtk_menu_new();
     Task * tk_cursor;
@@ -1661,7 +1688,7 @@ static void task_show_window_list(Task * tk, GdkEventButton * event, gboolean si
     {
         if (tc)
         {
-            for (tk_cursor = tc->res_class_head; tk_cursor != NULL; tk_cursor = tk_cursor->res_class_flink)
+            for (tk_cursor = tc->task_class_head; tk_cursor != NULL; tk_cursor = tk_cursor->task_class_flink)
             {
                 task_show_window_list_helper(tk_cursor, menu, tb);
             }
@@ -1675,7 +1702,7 @@ static void task_show_window_list(Task * tk, GdkEventButton * event, gboolean si
     {
         for (tk_cursor = tb->task_list; tk_cursor != NULL; tk_cursor = tk_cursor->task_flink)
         {
-            if (!similar || tk_cursor->res_class == tc)
+            if (!similar || tk_cursor->task_class == tc)
                 task_show_window_list_helper(tk_cursor, menu, tb);
         }
     }
@@ -1699,9 +1726,9 @@ static void task_activate_neighbour(Task * tk, GdkEventButton * event, gboolean 
     if (!tk)
         return;
 
-    if (in_group && tk->res_class)
+    if (in_group && tk->task_class)
     {
-        if (tk->tb->focused && tk->res_class == tk->tb->focused->res_class)
+        if (tk->tb->focused && tk->task_class == tk->tb->focused->task_class)
             tk = tk->tb->focused;
     }
 
@@ -1715,7 +1742,7 @@ static void task_activate_neighbour(Task * tk, GdkEventButton * event, gboolean 
             continue;
         }
         gboolean ok = task_is_visible_on_current_desktop(tk_cursor)
-            && (!in_group || (tk->res_class && tk->res_class == tk_cursor->res_class));
+            && (!in_group || (tk->task_class && tk->task_class == tk_cursor->task_class));
         if (ok)
         {
             if (next)
@@ -1945,7 +1972,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
        return TRUE;
 
     TaskbarPlugin * tb = tk->tb;
-    TaskClass * tc = tk->res_class;
+    TaskClass * tc = tk->task_class;
     if (task_is_folded(tk) && (GTK_IS_BUTTON(widget)))
     {
         /* If this is a grouped-task representative, meaning that there is a class with at least two windows,
@@ -1959,7 +1986,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
         Task * visible_task = (
             (tb->single_window) ? tb->focused :
             (!task_is_folded(tk)) ? tk :
-            (tk->res_class) ? tk->res_class->visible_task :
+            (tk->task_class) ? tk->task_class->visible_task :
             tk);
         task_group_menu_destroy(tb);
 
@@ -1975,7 +2002,7 @@ static gboolean taskbar_task_control_event(GtkWidget * widget, GdkEventButton * 
     }
 
     /* As a matter of policy, avoid showing selected or prelight states on flat buttons. */
-    if (task_button_is_really_flat(tb))
+    if (taskbar_task_button_is_really_flat(tb))
         gtk_widget_set_state(widget, GTK_STATE_NORMAL);
     return TRUE;
 }
@@ -2039,7 +2066,7 @@ static void taskbar_button_drag_leave(GtkWidget * widget, GdkDragContext * drag_
 static void taskbar_button_enter(GtkWidget * widget, Task * tk)
 {
     tk->entered_state = TRUE;
-    if (task_button_is_really_flat(tk->tb))
+    if (taskbar_task_button_is_really_flat(tk->tb))
         gtk_widget_set_state(widget, GTK_STATE_NORMAL);
     task_draw_label(tk);
 }
@@ -2129,9 +2156,9 @@ static void taskbar_image_size_allocate(GtkWidget * img, GtkAllocation * alloc, 
 static void taskbar_update_style(TaskbarPlugin * tb)
 {
     GtkOrientation bo = (tb->plug->panel->orientation == ORIENT_HORIZ) ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL;
-    icon_grid_set_expand(tb->icon_grid, get_task_button_expandable(tb));
+    icon_grid_set_expand(tb->icon_grid, taskbar_task_button_is_expandable(tb));
     icon_grid_set_geometry(tb->icon_grid, bo,
-        get_task_button_max_width(tb), tb->icon_size + BUTTON_HEIGHT_EXTRA,
+        taskbar_get_task_button_max_width(tb), tb->icon_size + BUTTON_HEIGHT_EXTRA,
         tb->spacing, 0, tb->plug->panel->height);
 }
 
@@ -2159,18 +2186,6 @@ static void task_update_style(Task * tk, TaskbarPlugin * tb)
     }
 
     task_button_redraw_button_state(tk, tb);
-/*
-    if( task_button_is_really_flat(tb) )
-    {
-        gtk_toggle_button_set_active((GtkToggleButton*)tk->button, FALSE);
-        gtk_button_set_relief(GTK_BUTTON(tk->button), GTK_RELIEF_NONE);
-    }
-    else
-    {
-        gtk_toggle_button_set_active((GtkToggleButton*)tk->button, tk->focused);
-        gtk_button_set_relief(GTK_BUTTON(tk->button), GTK_RELIEF_NORMAL);
-    }
-*/
     task_draw_label(tk);
 }
 
@@ -2304,8 +2319,8 @@ static int task_compare(Task * tk1, Task * tk2)
         case GROUP_BY_CLASS:
         case GROUP_BY_NONE:
         {
-            int w1 = tk1->res_class ? tk1->res_class->timestamp : INT_MAX;
-            int w2 = tk2->res_class ? tk2->res_class->timestamp : INT_MAX;
+            int w1 = tk1->task_class ? tk1->task_class->timestamp : INT_MAX;
+            int w2 = tk2->task_class ? tk2->task_class->timestamp : INT_MAX;
             result = w2 - w1;
             break;
         }
@@ -2603,7 +2618,7 @@ static void taskbar_set_active_window(TaskbarPlugin * tb, Window f)
         ntk->focus_timestamp = ++tb->task_timestamp;
         ntk->focused = TRUE;
         tb->focused = ntk;
-        recompute_group_visibility_for_class(tb, ntk->res_class);
+        recompute_group_visibility_for_class(tb, ntk->task_class);
         task_button_redraw(ntk);
         task_update_sorting(ntk, SORT_BY_FOCUS);
     }
@@ -2764,12 +2779,12 @@ static void taskbar_property_notify_event(TaskbarPlugin *tb, XEvent *ev)
                 {
                     /* Window changed name. */
                     task_set_names(tk, at);
-                    if (tk->res_class != NULL)
+                    if (tk->task_class != NULL)
                     {
                         /* A change to the window name may change the visible name of the class. */
-                        recompute_group_visibility_for_class(tb, tk->res_class);
-                        if (tk->res_class->visible_task != NULL)
-                            task_draw_label(tk->res_class->visible_task);
+                        recompute_group_visibility_for_class(tb, tk->task_class);
+                        if (tk->task_class->visible_task != NULL)
+                            task_draw_label(tk->task_class->visible_task);
                     }
                     task_update_sorting(tk, SORT_BY_TITLE);
                 }
@@ -2895,10 +2910,10 @@ static void menu_ungroup_window(GtkWidget * widget, TaskbarPlugin * tb)
 
 static void menu_move_to_group(GtkWidget * widget, TaskbarPlugin * tb)
 {
-    TaskClass * tc = (TaskClass *)(g_object_get_data(G_OBJECT(widget), "res_class"));
-    if (tc && tc->res_class)
+    TaskClass * tc = (TaskClass *)(g_object_get_data(G_OBJECT(widget), "class_name"));
+    if (tc && tc->class_name)
     {
-        char * name = g_strdup(tc->res_class);
+        char * name = g_strdup(tc->class_name);
         task_set_override_class(tb->menutask, name);
         g_free(name);
     }
@@ -2931,7 +2946,7 @@ static void menu_move_to_new_group(GtkWidget * widget, TaskbarPlugin * tb)
 
 static void menu_unfold_group_window(GtkWidget * widget, TaskbarPlugin * tb)
 {
-    TaskClass * tc = tb->menutask->res_class;
+    TaskClass * tc = tb->menutask->task_class;
     if (tc)
     {
         tc->unfold = TRUE;
@@ -2947,7 +2962,7 @@ static void menu_unfold_group_window(GtkWidget * widget, TaskbarPlugin * tb)
 
 static void menu_fold_group_window(GtkWidget * widget, TaskbarPlugin * tb)
 {
-    TaskClass * tc = tb->menutask->res_class;
+    TaskClass * tc = tb->menutask->task_class;
     if (tc)
     {
         tc->unfold = FALSE;
@@ -3028,15 +3043,15 @@ static void task_adjust_menu_move_to_group(Task * tk)
     GtkWidget * move_to_group_menu = gtk_menu_new();
 
     TaskClass * tc;
-    for (tc = tk->tb->res_class_list; tc != NULL; tc = tc->res_class_flink)
+    for (tc = tk->tb->task_class_list; tc != NULL; tc = tc->task_class_flink)
     {
-        if (tc->visible_count && tk->res_class != tc)
+        if (tc->visible_count && tk->task_class != tc)
         {
-            gchar * label = g_strdup((tc->res_class && strlen(tc->res_class) > 0) ? tc->res_class : _("(unnamed)"));
+            gchar * label = g_strdup((tc->class_name && strlen(tc->class_name) > 0) ? tc->class_name : _("(unnamed)"));
             GtkWidget * mi = gtk_menu_item_new_with_label(label);
             g_free(label);
 
-            g_object_set_data(G_OBJECT(mi), "res_class", tc);
+            g_object_set_data(G_OBJECT(mi), "class_name", tc);
             g_signal_connect(mi, "activate", G_CALLBACK(menu_move_to_group), tk->tb);
             gtk_menu_shell_append(GTK_MENU_SHELL(move_to_group_menu), mi);
         }
@@ -3067,12 +3082,12 @@ static void task_adjust_menu(Task * tk, gboolean from_popup_menu)
     if (manual_grouping)
         task_adjust_menu_move_to_group(tk);
     gtk_widget_set_visible(GTK_WIDGET(tb->move_to_group_menuitem), manual_grouping);
-    gtk_widget_set_visible(GTK_WIDGET(tb->ungroup_menuitem), manual_grouping && tk->res_class && tk->res_class->visible_count > 1);
+    gtk_widget_set_visible(GTK_WIDGET(tb->ungroup_menuitem), manual_grouping && tk->task_class && tk->task_class->visible_count > 1);
 
     gtk_widget_set_visible(GTK_WIDGET(tb->unfold_group_menuitem),
-        manual_grouping && !tb->_show_single_group && tk->res_class && task_is_folded(tk));
+        manual_grouping && !tb->_show_single_group && tk->task_class && task_is_folded(tk));
     gtk_widget_set_visible(GTK_WIDGET(tk->tb->fold_group_menuitem),
-        manual_grouping && !tb->_show_single_group && tk->res_class && !task_is_folded(tk));
+        manual_grouping && !tb->_show_single_group && tk->task_class && !task_is_folded(tk));
 
     gtk_widget_set_visible(GTK_WIDGET(tb->maximize_menuitem), !tk->maximized);
     gtk_widget_set_visible(GTK_WIDGET(tb->restore_menuitem), tk->maximized);
@@ -3231,7 +3246,7 @@ static void taskbar_build_gui(Plugin * p)
     /* Make container for task buttons as a child of top level widget. */
     GtkOrientation bo = (tb->plug->panel->orientation == ORIENT_HORIZ) ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL;
     tb->icon_grid = icon_grid_new(p->panel, p->pwid, bo, tb->task_width_max, tb->icon_size, tb->spacing, 0, p->panel->height);
-    icon_grid_set_expand(tb->icon_grid, get_task_button_expandable(tb));
+    icon_grid_set_expand(tb->icon_grid, taskbar_task_button_is_expandable(tb));
     taskbar_update_style(tb);
 
     /* Add GDK event filter. */
@@ -3528,11 +3543,11 @@ static void taskbar_destructor(Plugin * p)
         task_delete(tb, tb->task_list, TRUE);
 
     /* Deallocate class list. */
-    while (tb->res_class_list != NULL)
+    while (tb->task_class_list != NULL)
     {
-        TaskClass * tc = tb->res_class_list;
-        tb->res_class_list = tc->res_class_flink;
-        g_free(tc->res_class);
+        TaskClass * tc = tb->task_class_list;
+        tb->task_class_list = tc->task_class_flink;
+        g_free(tc->class_name);
         g_free(tc);
     }
 
@@ -3722,9 +3737,9 @@ static void taskbar_panel_configuration_changed(Plugin * p)
     taskbar_update_style(tb);
     taskbar_make_menu(tb);
     GtkOrientation bo = (tb->plug->panel->orientation == ORIENT_HORIZ) ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL;
-    icon_grid_set_expand(tb->icon_grid, get_task_button_expandable(tb));
+    icon_grid_set_expand(tb->icon_grid, taskbar_task_button_is_expandable(tb));
     icon_grid_set_geometry(tb->icon_grid, bo,
-        get_task_button_max_width(tb), tb->plug->panel->icon_size + BUTTON_HEIGHT_EXTRA,
+        taskbar_get_task_button_max_width(tb), tb->plug->panel->icon_size + BUTTON_HEIGHT_EXTRA,
         tb->spacing, 0, tb->plug->panel->height);
 
     /* If the icon size changed, refetch all the icons. */
