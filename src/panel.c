@@ -109,7 +109,7 @@ static Panel* panel_allocate(void)
     p->usefontsize = 0;
     p->fontsize = 10;
     p->spacing = 0;
-    p->icon_size = PANEL_ICON_SIZE;
+    p->preferred_icon_size = PANEL_ICON_SIZE;
     return p;
 }
 
